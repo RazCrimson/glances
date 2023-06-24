@@ -13,8 +13,8 @@ import os
 from copy import deepcopy
 
 from glances.logger import logger
-from glances.plugins.containers.engines.docker import DockerContainersExtension, import_docker_error_tag
-from glances.plugins.containers.engines.podman import PodmanContainersExtension, import_podman_error_tag
+from glances.plugins.containers.engines.docker import DockerExtension, import_docker_error_tag
+from glances.plugins.containers.engines.podman import PodmanExtension, import_podman_error_tag
 from glances.plugins.plugin.model import GlancesPluginModel
 from glances.processes import glances_processes
 from glances.processes import sort_stats as sort_stats_processes
@@ -76,13 +76,13 @@ class PluginModel(GlancesPluginModel):
         self.display_curse = True
 
         # Init the Docker API
-        self.docker_extension = DockerContainersExtension() if not import_docker_error_tag else None
+        self.docker_extension = DockerExtension() if not import_docker_error_tag else None
 
         # Init the Podman API
         if import_podman_error_tag:
             self.podman_client = None
         else:
-            self.podman_client = PodmanContainersExtension(podman_sock=self._podman_sock())
+            self.podman_client = PodmanExtension(podman_sock=self._podman_sock())
 
         # Sort key
         self.sort_key = None

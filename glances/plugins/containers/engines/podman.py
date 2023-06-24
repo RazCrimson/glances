@@ -7,16 +7,24 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 
 """Podman Extension unit for Glances' Containers plugin."""
+from __future__ import annotations
+
+import time
 from datetime import datetime
+from typing import Any, Dict, Optional, List
 
 from glances.globals import iterkeys, itervalues, nativestr, pretty_date, string_value_to_float
 from glances.logger import logger
-from glances.plugins.containers.stats_streamer import StatsStreamer
+from glances.plugins.containers.engines.interface import ContainersExtension, ContainersStatistics
+from glances.plugins.containers.engines.utils import IterableStreamer
 
 # Podman library (optional and Linux-only)
 # https://pypi.org/project/podman/
 try:
     from podman import PodmanClient
+    from podman.domain.containers import Container
+    from podman.domain.pods import Pod
+    from podman.domain.pods_manager import PodsManager
 except Exception as e:
     import_podman_error_tag = True
     # Display debug message if import KeyError
@@ -24,16 +32,18 @@ except Exception as e:
 else:
     import_podman_error_tag = False
 
+LOG_PREFIX = 'containers plugin (podman) -'
+
 
 class PodmanContainerStatsFetcher:
     MANDATORY_FIELDS = ["CPU", "MemUsage", "MemLimit", "NetInput", "NetOutput", "BlockInput", "BlockOutput"]
 
-    def __init__(self, container):
-        self._container = container
+    def __init__(self, container: Container):
+        self._container: Container = container
 
         # Threaded Streamer
         stats_iterable = container.stats(decode=True)
-        self._streamer = StatsStreamer(stats_iterable, initial_stream_value={})
+        self._streamer: IterableStreamer = IterableStreamer(stats_iterable, initial_stream_value={})
 
     def _log_debug(self, msg, exception=None):
         logger.debug("containers (Podman) ID: {} - {} ({})".format(self._container.id, msg, exception))
@@ -91,7 +101,7 @@ class PodmanPodStatsFetcher:
         # Threaded Streamer
         # Temporary patch to get podman extension working
         stats_iterable = (pod_manager.stats(decode=True) for _ in iter(int, 1))
-        self._streamer = StatsStreamer(stats_iterable, initial_stream_value={}, sleep_duration=2)
+        self._streamer = IterableStreamer(stats_iterable, initial_stream_value={}, sleep_duration=2)
 
     def _log_debug(self, msg, exception=None):
         logger.debug("containers (Podman): Pod Manager - {} ({})".format(msg, exception))
@@ -209,92 +219,114 @@ class PodmanPodStatsFetcher:
         return {"ior": ior, "iow": iow, "time_since_update": 1}
 
 
-class PodmanContainersExtension:
+class PodmanExtension(ContainersExtension):
     """Glances' Containers Plugin's Docker Extension unit"""
+
+    CONTAINERS_KEY = 'name'  # key of the stats list
+
+    VERSION_UPDATE_INTERVAL = 300  # seconds
 
     CONTAINER_ACTIVE_STATUS = ['running', 'paused']
 
-    def __init__(self, podman_sock):
+    def __init__(self, client: PodmanClient):
+        self._client: PodmanClient = client
+
+        self._last_version_fetch: int = 0
+        self._version_info: Dict[str, Any] = {}
+
+        self._container_stats_fetchers: Dict[str, PodmanContainerStatsFetcher] = {}
+        self._pods_stats_fetcher: PodmanPodStatsFetcher = PodmanPodStatsFetcher(self._client.pods)
+
+    @classmethod
+    def connect(cls, **kwargs: Dict[str, Any]) -> Optional[PodmanExtension]:
         if import_podman_error_tag:
-            raise Exception("Missing libs required to run Podman Extension (Containers)")
+            logger.error(f"{LOG_PREFIX} Missing required libs for Extension")
+            return None
 
-        self.client = None
-        self.ext_name = "containers (Podman)"
-        self.podman_sock = podman_sock
-        self.pods_stats_fetcher = None
-        self.container_stats_fetchers = {}
-
-        self.connect()
-
-    def connect(self):
-        """Connect to Podman."""
+        # Init the Docker API Client
         try:
-            self.client = PodmanClient(base_url=self.podman_sock)
-            # PodmanClient works lazily, so make a ping to determine if socket is open
-            self.client.ping()
+            client = PodmanClient()
+            client.ping()  # Ping to actually trigger connection
         except Exception as e:
-            logger.error("{} plugin - Can't connect to Podman ({})".format(self.ext_name, e))
-            self.client = None
+            logger.error(f"{LOG_PREFIX} - Can't connect to Engine ({e})")
+            return None
 
-    def update_version(self):
-        # Long and not useful anymore because the information is no more displayed in UIs
-        # return self.client.version()
-        return {}
+        return cls(client)
 
-    def stop(self):
+    @property
+    def version(self) -> Dict:
+        return self._version_info
+
+    def terminate(self) -> None:
         # Stop all streaming threads
-        for t in itervalues(self.container_stats_fetchers):
+        for t in itervalues(self._container_stats_fetchers):
             t.stop()
 
-        if self.pods_stats_fetcher:
-            self.pods_stats_fetcher.stop()
+        self._pods_stats_fetcher.stop()
 
-    def update(self, all_tag):
-        """Update Podman stats using the input method."""
+        # Close socket connection
+        self._client.close()
 
-        if not self.client:
-            return {}, []
+    def stats(self, all_containers: bool = False) -> ContainersStatistics:
 
-        version_stats = self.update_version()
+        # Timestamp based periodic updates for version_info
+        # Why? - version fetches are slow
+        curr_time = time.time()
+        if curr_time - self._last_version_fetch > self.VERSION_UPDATE_INTERVAL:
+            try:
+                self._version_info = self._client.version()
+            except Exception as e:
+                logger.error(f"{LOG_PREFIX} Version update failed ({e})")
+                self._version_info = {}
 
-        # Update current containers list
-        try:
-            # Issue #1152: Podman module doesn't export details about stopped containers
-            # The Containers/all key of the configuration file should be set to True
-            containers = self.client.containers.list(all=all_tag)
-            if not self.pods_stats_fetcher:
-                self.pods_stats_fetcher = PodmanPodStatsFetcher(self.client.pods)
-        except Exception as e:
-            logger.error("{} plugin - Can't get containers list ({})".format(self.ext_name, e))
-            return version_stats, []
-
-        # Start new thread for new container
-        for container in containers:
-            if container.id not in self.container_stats_fetchers:
-                # StatsFetcher did not exist in the internal dict
-                # Create it, add it to the internal dict
-                logger.debug("{} plugin - Create thread for container {}".format(self.ext_name, container.id[:12]))
-                self.container_stats_fetchers[container.id] = PodmanContainerStatsFetcher(container)
-
-        # Stop threads for non-existing containers
-        absent_containers = set(iterkeys(self.container_stats_fetchers)) - set(c.id for c in containers)
-        for container_id in absent_containers:
-            # Stop the StatsFetcher
-            logger.debug("{} plugin - Stop thread for old container {}".format(self.ext_name, container_id[:12]))
-            self.container_stats_fetchers[container_id].stop()
-            # Delete the StatsFetcher from the dict
-            del self.container_stats_fetchers[container_id]
+            self._last_version_fetch = curr_time
 
         # Get stats for all containers
-        container_stats = [self.generate_stats(container) for container in containers]
+        containers = self.fetch_containers(all_containers)
+        container_stats = [self.construct_container_statistics(container) for container in containers]
 
-        pod_stats = self.pods_stats_fetcher.activity_stats
+        pod_stats = self._pods_stats_fetcher.activity_stats
         for stats in container_stats:
             if stats["Id"][:12] in pod_stats:
                 stats["pod_name"] = pod_stats[stats["Id"][:12]]["name"]
                 stats["pod_id"] = pod_stats[stats["Id"][:12]]["pod_id"]
 
-        return version_stats, container_stats
+        return ContainersStatistics(
+            engine=self.engine,
+            version=self.version,
+            containers=container_stats
+        )
+
+    def fetch_containers(self, all_containers: bool = False) -> List[Container]:
+        """Fetches current containers and start stats streams for active containers"""
+
+        # Update current containers list
+        try:
+            # Issue #1152: module doesn't export details about stopped containers
+            # The Containers/all key of the configuration file should be set to True
+            containers = self._client.containers.list(all=all_containers)
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX} Can't get containers list ({e})")
+            return []
+
+        # Start new thread for new container
+        for container in containers:
+            if container.id not in self._container_stats_fetchers:
+                # StatsFetcher did not exist in the internal dict
+                # Create it, add it to the internal dict
+                logger.debug(f"{LOG_PREFIX} Create thread for container {container.id[:12]}")
+                self._container_stats_fetchers[container.id] = PodmanContainerStatsFetcher(container)
+
+        # Stop threads for non-existing containers
+        absent_containers = set(iterkeys(self._container_stats_fetchers)) - set(c.id for c in containers)
+        for container_id in absent_containers:
+            # Stop the StatsFetcher
+            logger.debug(f"{LOG_PREFIX} Stop thread for old container {container_id[:12]}")
+            self._container_stats_fetchers[container_id].stop()
+            # Delete the StatsFetcher from the dict
+            del self._container_stats_fetchers[container_id]
+
+        return containers
 
     @property
     def key(self):
@@ -319,7 +351,7 @@ class PodmanContainersExtension:
 
         if stats['Status'] in self.CONTAINER_ACTIVE_STATUS:
             started_at = datetime.fromtimestamp(container.attrs['StartedAt'])
-            stats_fetcher = self.container_stats_fetchers[container.id]
+            stats_fetcher = self._container_stats_fetchers[container.id]
             activity_stats = stats_fetcher.activity_stats
             stats.update(activity_stats)
 

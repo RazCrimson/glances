@@ -6,44 +6,45 @@
 #
 # SPDX-License-Identifier: LGPL-3.0-only
 
-import threading
 import time
+from threading import Thread, Event, Lock
+from typing import Any, Iterable, Dict
 
 from glances.logger import logger
 
 
-class StatsStreamer:
+class IterableStreamer:
     """
     Utility class to stream an iterable using a background / daemon Thread
 
     Use `StatsStreamer.stats` to access the latest streamed results
     """
 
-    def __init__(self, iterable, initial_stream_value=None, sleep_duration=0.1):
+    def __init__(self, iterable: Iterable, initial_stream_value: Any = None, sleep_duration: float = 0.1):
         """
         iterable: an Iterable instance that needs to be streamed
         """
-        self._iterable = iterable
+        self._iterable: Iterable = iterable
         # Iterable results are stored here
-        self._raw_result = initial_stream_value
+        self._raw_result: Any = initial_stream_value
         # Use a Thread to stream iterable (daemon=True to automatically kill thread when main process dies)
-        self._thread = threading.Thread(target=self._stream_results, daemon=True)
+        self._thread: Thread = Thread(target=self._stream_results, daemon=True)
         # Event needed to stop the thread manually
-        self._stopper = threading.Event()
+        self._stopper: Event = Event()
         # Lock to avoid the daemon thread updating stats when main thread reads the stats
-        self.result_lock = threading.Lock()
+        self.result_lock: Lock = Lock()
         # Last result streamed time (initial val 0)
-        self._last_update_time = 0
+        self._last_update_time: int = 0
         # Time to sleep before next iteration
-        self._sleep_duration = sleep_duration
+        self._sleep_duration: float = sleep_duration
 
         self._thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         """Stop the thread."""
         self._stopper.set()
 
-    def stopped(self):
+    def stopped(self) -> bool:
         """Return True is the thread is stopped."""
         return self._stopper.is_set()
 
@@ -66,21 +67,23 @@ class StatsStreamer:
             logger.debug("docker plugin - Exception thrown during run ({})".format(e))
             self.stop()
 
-    def _pre_update_hook(self):
+    def _pre_update_hook(self) -> None:
         """Hook that runs before worker thread updates the raw_stats"""
         self.result_lock.acquire()
 
-    def _post_update_hook(self):
+    def _post_update_hook(self) -> None:
         """Hook that runs after worker thread updates the raw_stats"""
         self._last_update_time = time.time()
         self.result_lock.release()
 
     @property
-    def stats(self):
+    def stats(self) -> Any:
         """Raw Stats getter."""
         return self._raw_result
 
     @property
-    def last_update_time(self):
-        """Raw Stats getter."""
+    def last_update_time(self) -> int:
+        """Last time an entry was streamed."""
         return self._last_update_time
+
+

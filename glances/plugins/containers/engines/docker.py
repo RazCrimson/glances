@@ -7,18 +7,23 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 #
 
-"""Docker Extension unit for Glances' Containers plugin."""
+"""Docker Extension for Glances' Containers plugin."""
+from __future__ import annotations
+
 import time
+from typing import Optional, Dict, Any, List
 
 from glances.globals import iterkeys, itervalues, nativestr, pretty_date
 from glances.logger import logger
-from glances.plugins.containers.stats_streamer import StatsStreamer
+from glances.plugins.containers.engines.interface import ContainersExtension, ContainersStatistics, BaseExtension
+from glances.plugins.containers.engines.utils import IterableStreamer
 
 # Docker-py library (optional and Linux-only)
 # https://github.com/docker/docker-py
 try:
     import requests
-    import docker
+    from docker import DockerClient
+    from docker.models.containers import Container
     from dateutil import parser, tz
 except Exception as e:
     import_docker_error_tag = True
@@ -27,26 +32,28 @@ except Exception as e:
 else:
     import_docker_error_tag = False
 
+LOG_PREFIX = 'containers plugin (docker) -'
+
 
 class DockerStatsFetcher:
     MANDATORY_MEMORY_FIELDS = ["usage", 'limit']
 
-    def __init__(self, container):
-        self._container = container
+    def __init__(self, container: Container):
+        self._container: Container = container
 
         # Previous computes stats are stored in the self._old_computed_stats variable
         # We store time data to enable IoR/s & IoW/s calculations to avoid complexity for consumers of the APIs exposed.
-        self._old_computed_stats = {}
+        self._old_computed_stats: Dict = {}
 
         # Last time when output stats (results) were computed
-        self._last_stats_computed_time = 0
+        self._last_stats_computed_time: int = 0
 
         # Threaded Streamer
         stats_iterable = container.stats(decode=True)
-        self._streamer = StatsStreamer(stats_iterable, initial_stream_value={})
+        self._streamer: IterableStreamer = IterableStreamer(stats_iterable, initial_stream_value={})
 
-    def _log_debug(self, msg, exception=None):
-        logger.debug("containers (Docker) ID: {} - {} ({}) ".format(self._container.id, msg, exception))
+    def _log_debug(self, msg: str, exception: Exception = None):
+        logger.debug(f"{LOG_PREFIX} ID: {self._container.id} - {msg} ({exception}) ")
         logger.debug(self._streamer.stats)
 
     def stop(self):
@@ -210,88 +217,97 @@ class DockerStatsFetcher:
         return stats
 
 
-class DockerContainersExtension:
-    """Glances' Containers Plugin's Docker Extension unit"""
+class DockerExtension(BaseExtension):
+    """Glances' Containers Plugin's Docker Extension"""
 
     CONTAINER_ACTIVE_STATUS = ['running', 'paused']
 
-    def __init__(self):
+    def __init__(self, client: DockerClient):
+        super(BaseExtension, self).__init__(client)
+
+    @classmethod
+    def connect(cls, **kwargs: Dict[str, Any]) -> Optional[DockerExtension]:
         if import_docker_error_tag:
-            raise Exception("Missing libs required to run Docker Extension (Containers) ")
+            logger.error(f"{LOG_PREFIX} Missing required libs for Extension")
+            return None
 
-        self.client = None
-        self.ext_name = "containers (Docker)"
-        self.stats_fetchers = {}
-
-        self.connect()
-
-    def connect(self):
-        """Connect to the Docker server."""
         # Init the Docker API Client
         try:
             # Do not use the timeout option (see issue #1878)
-            self.client = docker.from_env()
+            client = DockerClient.from_env()
+            client.ping()  # Ping to actually trigger connection
         except Exception as e:
-            logger.error("{} plugin - Can't connect to Docker ({})".format(self.ext_name, e))
-            self.client = None
+            logger.error(f"{LOG_PREFIX} - Can't connect to Engine ({e})")
+            return None
 
-    def update_version(self):
-        # Long and not useful anymore because the information is no more displayed in UIs
-        # return self.client.version()
-        return {}
+        return cls(client)
 
-    def stop(self):
-        # Stop all streaming threads
-        for t in itervalues(self.stats_fetchers):
-            t.stop()
+    @property
+    def engine(self) -> str:
+        return "docker"
 
-    def update(self, all_tag):
-        """Update Docker stats using the input method."""
+    def create_container_watcher(self, container: Container) -> DockerStatsFetcher:
+        return DockerStatsFetcher(container)
 
-        if not self.client:
-            return {}, []
+    def stats(self, all_containers: bool = False) -> ContainersStatistics:
 
-        version_stats = self.update_version()
+        # Timestamp based periodic updates for version_info
+        # Why? - version fetches are slow
+        curr_time = time.time()
+        if curr_time - self._last_version_fetch > self.VERSION_UPDATE_INTERVAL:
+            try:
+                self._version_info = self._client.version()
+            except Exception as e:
+                logger.error(f"{LOG_PREFIX} Version update failed ({e})")
+                self._version_info = {}
+
+            self._last_version_fetch = curr_time
+
+        # Get stats for all containers
+        containers = self.fetch_containers(all_containers)
+        container_stats = [self.construct_container_statistics(container) for container in containers]
+
+        return ContainersStatistics(
+            engine=self.engine,
+            version=self.version,
+            containers=container_stats
+        )
+
+    def fetch_containers(self, all_containers: bool = False) -> List[Container]:
+        """Fetches current containers and start stats streams for active containers"""
 
         # Update current containers list
         try:
-            # Issue #1152: Docker module doesn't export details about stopped containers
+            # Issue #1152: zmodule doesn't export details about stopped containers
             # The Containers/all key of the configuration file should be set to True
-            containers = self.client.containers.list(all=all_tag)
+            containers = self._client.containers.list(all=all_containers)
         except Exception as e:
-            logger.error("{} plugin - Can't get containers list ({})".format(self.ext_name, e))
-            return version_stats, []
+            logger.error(f"{LOG_PREFIX} Can't get containers list ({e})")
+            return []
 
         # Start new thread for new container
         for container in containers:
-            if container.id not in self.stats_fetchers:
+            if container.id not in self._stats_fetchers:
                 # StatsFetcher did not exist in the internal dict
                 # Create it, add it to the internal dict
-                logger.debug("{} plugin - Create thread for container {}".format(self.ext_name, container.id[:12]))
-                self.stats_fetchers[container.id] = DockerStatsFetcher(container)
+                logger.debug(f"{LOG_PREFIX} Create thread for container {container.id[:12]}")
+                self._stats_fetchers[container.id] = DockerStatsFetcher(container)
 
         # Stop threads for non-existing containers
-        absent_containers = set(iterkeys(self.stats_fetchers)) - set(c.id for c in containers)
+        absent_containers = set(iterkeys(self._stats_fetchers)) - set(c.id for c in containers)
         for container_id in absent_containers:
             # Stop the StatsFetcher
-            logger.debug("{} plugin - Stop thread for old container {}".format(self.ext_name, container_id[:12]))
-            self.stats_fetchers[container_id].stop()
+            logger.debug(f"{LOG_PREFIX} Stop thread for old container {container_id[:12]}")
+            self._stats_fetchers[container_id].stop()
             # Delete the StatsFetcher from the dict
-            del self.stats_fetchers[container_id]
+            del self._stats_fetchers[container_id]
 
-        # Get stats for all containers
-        container_stats = [self.generate_stats(container) for container in containers]
-        return version_stats, container_stats
+        return containers
 
-    @property
-    def key(self):
-        """Return the key of the list."""
-        return 'name'
-
-    def generate_stats(self, container):
+    def construct_container_statistics(self, container: Container) -> Dict[str, Any]:
         # Init the stats for the current container
         stats = {
-            'key': self.key,
+            'key': self.CONTAINERS_KEY,
             # Export name
             'name': nativestr(container.name),
             # Container Id
@@ -318,7 +334,7 @@ class DockerContainersExtension:
 
         if stats['Status'] in self.CONTAINER_ACTIVE_STATUS:
             started_at = container.attrs['State']['StartedAt']
-            stats_fetcher = self.stats_fetchers[container.id]
+            stats_fetcher = self._stats_fetchers[container.id]
             activity_stats = stats_fetcher.activity_stats
             stats.update(activity_stats)
 
